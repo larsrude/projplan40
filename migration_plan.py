@@ -25,8 +25,8 @@ from pptx.util import Inches, Pt, Emu
 #  PARAMETER TABLES  (edit these to change the plan)
 # ----------------------------------------------------------------------------
 
-PLAN_START = dt.date(2025, 1, 6)   # first working day of the plan
-WORKDAYS_PER_WEEK = 5              # only 5 days a week are used
+PLAN_START = dt.date(2026, 1, 11)   # first working day of the plan
+WORKDAYS_PER_WEEK = 5               # only 5 days a week are used
 
 # (i) Migration activities: name -> type. Types carry default durations.
 ACTIVITIES = {
@@ -471,8 +471,8 @@ def main():
     sched = Scheduler()
     plans = sched.plan()
     print_plans(plans, sched)
-    build_deck(plans, sched, args.output)
-    print(f"\nPowerPoint deck written to: {args.output}")
+#    build_deck(plans, sched, args.output)
+#    print(f"\nPowerPoint deck written to: {args.output}")
 
 if __name__ == "__main__":
     main()
