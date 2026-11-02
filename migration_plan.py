@@ -678,7 +678,7 @@ def print_plans(plans, sched):
               f"({TEST_SIZES[p['sit_size']]['sit_days']}d) | E2E {p['e2e_runs']}x{p['e2e_size']} "
               f"({TEST_SIZES[p['e2e_size']]['e2e_days']}d) | app test {p['application_test']}wk "
               f"| app test migrated {p['application_test_migrated']}wk "
-              f"| inflight {p['inflight_order_test']}wk | dress rehearsal {p['dress_rehearsal']}wk "
+              f"| inflight {p['inflight_order_test']}wk | dress rehearsal {p['dress_rehearsal_days']}d "
               f"({p['dress_rehearsal_size']}) | FUT {p['fut']}wk")
     for e, v in ENVIRONMENTS.items():
         wins = "; ".join(f"{frm} to {to}" for frm, to in v["windows"])
