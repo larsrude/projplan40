@@ -568,8 +568,62 @@ def print_overview(plans):
         print(f"\n  !! WARNING: activities finishing after the planning horizon: {', '.join(late)}")
     print()
 
+def print_env_use(sched):
+    """Environment use over time: booked environment-days per month."""
+    print("=" * 100)
+    print("ENVIRONMENT USE OVER TIME  (booked environment-days per month; "
+          "n/a = outside availability window)")
+    print("=" * 100)
+
+    # Month buckets from plan start to horizon
+    months = []
+    y, m = PLAN_START.year, PLAN_START.month
+    while (y, m) <= (PLAN_END.year, PLAN_END.month):
+        months.append((y, m))
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+
+    # Booked days per environment per month
+    use = {e: {(yy, mm): 0 for (yy, mm) in months} for e in ENVIRONMENTS}
+    for env, bookings in sched.env_bookings.items():
+        for _, day in bookings:
+            key = (day.year, day.month)
+            if key in use[env]:
+                use[env][key] += 1
+
+    def avail_in_month(env, ym):
+        y, m = ym
+        for frm, to in ENVIRONMENTS[env]["windows"]:
+            if not (d(to).year < y or (d(to).year == y and d(to).month < m)) and \
+               not (d(frm).year > y or (d(frm).year == y and d(frm).month > m)):
+                return True
+        return False
+
+    hdr = "  {:<10s} {:<7s}".format("Environm.", "Cap") \
+        + "".join(f"{dt.date(y, m, 1).strftime('%b%y'):>6s}" for (y, m) in months) \
+        + f"{'Total':>7s}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    grand = 0
+    for e in sorted(ENVIRONMENTS):
+        total = len(sched.env_bookings[e])
+        grand += total
+        row = "  {:<10s} {:<7s}".format(e, ENVIRONMENTS[e]["capacity"])
+        for ym in months:
+            if avail_in_month(e, ym):
+                row += f"{use[e][ym]:>6d}"
+            else:
+                row += f"{'n/a':>6s}"
+        row += f"{total:>7d}"
+        print(row)
+    print("  " + "-" * (len(hdr) - 2))
+    print(f"  {'Total':<18s}".format("") + " " * (6 * len(months)) + f"{grand:>7d}")
+    print()
+
 def print_plans(plans, sched):
     print_overview(plans)
+    print_env_use(sched)
     print("=" * 100)
     print("DETAIL")
     print("=" * 100)
