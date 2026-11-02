@@ -92,6 +92,11 @@ ENVIRONMENTS = {
     "ENV-D": dict(capacity="small",  windows=[("2027-03-01", "2027-12-31")]),
 }
 
+# Minimum break (calendar days) between the end of one run and the start of the
+# next run of an activity, by run kind. A SIT run is followed by >= 2 days break,
+# an E2E run by >= 3 days break (before the next SIT/E2E/DR run of that activity).
+RUN_BREAK_DAYS = {"SIT": 2, "E2E": 3, "DR": 0}
+
 # Minimum separation between any two go-lives (calendar days).
 GO_LIVE_SEPARATION_DAYS = 14
 
@@ -253,8 +258,10 @@ class Scheduler:
             n_days = entry[6] if len(entry) > 6 else None
             run = self.book_run(name, kind, size, ready, n_days=n_days)
             plans[name].runs.append(run)
-            # Chain the next run of this activity (SIT runs, then E2E runs)
-            nxt_ready = next_workday(run.end + dt.timedelta(days=1))
+            # Chain the next run of this activity (SIT runs, then E2E runs),
+            # honouring the minimum break after this run's kind.
+            break_days = RUN_BREAK_DAYS.get(kind, 0)
+            nxt_ready = next_workday(run.end + dt.timedelta(days=1 + break_days))
             rem = remaining[name]
             if kind == "SIT":
                 rem["sit"] -= 1
@@ -511,6 +518,8 @@ def slide_assumptions(prs):
         "(environment) -> FUT -> Go-live are sequential.",
         "Inflight order test runs in parallel with Application test migrated.",
         "SIT and E2E runs book a capable, available environment for consecutive working days.",
+        "Minimum break between runs of an activity: "
+        + ", ".join(f"{k} {v}d" for k, v in RUN_BREAK_DAYS.items() if v) + ".",
         "Environment conflicts resolve by priority (1 = highest, 6 = lowest): "
         + ", ".join(f"{n}={p}" for n, p in sorted(ACTIVITY_PRIORITY.items(), key=prio_sort_key)) + ".",
         "Go-lives are separated by at least "
