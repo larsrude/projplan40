@@ -26,6 +26,7 @@ from pptx.util import Inches, Pt, Emu
 # ----------------------------------------------------------------------------
 
 PLAN_START = dt.date(2026, 11, 1)   # first working day of the plan
+PLAN_END   = dt.date(2027, 12, 31) # last day of the planning horizon
 WORKDAYS_PER_WEEK = 5               # only 5 days a week are used
 
 # (i) Migration activities: name -> type. Types carry default durations.
@@ -78,10 +79,10 @@ TEST_SIZES = {
 #             "all"    = can take any size run.
 #   windows:  list of (from_date, to_date) inclusive availability periods.
 ENVIRONMENTS = {
-    "ENV-A": dict(capacity="all",    windows=[("2026-01-05", "2026-12-31")]),
-    "ENV-B": dict(capacity="all",    windows=[("2026-03-02", "2026-12-31")]),
-    "ENV-C": dict(capacity="small",  windows=[("2026-01-05", "2026-06-30")]),
-    "ENV-D": dict(capacity="small",  windows=[("2026-02-02", "2026-09-30")]),
+    "ENV-A": dict(capacity="all",    windows=[("2026-11-02", "2027-12-31")]),
+    "ENV-B": dict(capacity="all",    windows=[("2026-12-01", "2027-12-31")]),
+    "ENV-C": dict(capacity="small",  windows=[("2026-11-02", "2027-12-31")]),
+    "ENV-D": dict(capacity="small",  windows=[("2026-11-30", "2027-12-31")]),
 }
 
 # Priority order in which activities compete for environments.
@@ -199,7 +200,7 @@ class Scheduler:
                 continue
             p = PHASE_PARAMS[ACTIVITIES[name]]
             a = ActivityPlan(name, ACTIVITIES[name])
-            cursor = PLAN_START
+            cursor = next_workday(PLAN_START)   # roll to first working day
 
             # Development (weeks)
             end = add_workdays(cursor, p["development"] * WORKDAYS_PER_WEEK)
@@ -452,9 +453,35 @@ def build_deck(plans, sched, path):
 #  TEXT OUTPUT (console)
 # ----------------------------------------------------------------------------
 
-def print_plans(plans, sched):
+def print_overview(plans):
+    """Level 1 - one line per activity, key milestones."""
     print("=" * 100)
-    print("MIGRATION PLAN  (start %s, %d working days/week)" % (fmt(PLAN_START), WORKDAYS_PER_WEEK))
+    print(f"MIGRATION PLAN OVERVIEW   horizon: {fmt(PLAN_START)} -> {fmt(PLAN_END)}   "
+          f"({WORKDAYS_PER_WEEK} working days/week)")
+    print("=" * 100)
+    hdr = f"  {'Activity':<10s} {'Type':<8s} {'Start':<10s} {'Dev done':<10s} " \
+          f"{'Tests done':<10s} {'Ready':<10s} {'Go-live done':<12s} {'Weeks':>5s}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for name in ACTIVITY_PRIORITY:
+        if name not in plans:
+            continue
+        a = plans[name]
+        start = min(s for s, _ in a.phases.values())
+        tests = max((r.end for r in a.runs), default=a.phases["Application test"][0])
+        weeks = (a.golive - start).days // 7
+        print(f"  {a.name:<10s} {a.type:<8s} {fmt(start):<10s} {fmt(a.phases['Development'][1]):<10s} "
+              f"{fmt(tests):<10s} {fmt(a.ready):<10s} {fmt(a.golive):<12s} {weeks:>4d}")
+    # Horizon check
+    late = [a.name for a in plans.values() if a.golive > PLAN_END]
+    if late:
+        print(f"\n  !! WARNING: activities finishing after the planning horizon: {', '.join(late)}")
+    print()
+
+def print_plans(plans, sched):
+    print_overview(plans)
+    print("=" * 100)
+    print("DETAIL")
     print("=" * 100)
     for name in ACTIVITY_PRIORITY:
         if name not in plans:
@@ -472,6 +499,19 @@ def print_plans(plans, sched):
     print("\nEnvironment bookings:")
     for e in sorted(sched.env_bookings):
         print(f"  {e}: {len(sched.env_bookings[e])} days booked")
+
+    print("\nAssumptions:")
+    print(f"  Activities: {len(ACTIVITIES)} "
+          f"({sum(1 for t in ACTIVITIES.values() if t == 'simple')} simple, "
+          f"{sum(1 for t in ACTIVITIES.values() if t == 'complex')} complex)")
+    for typ, p in PHASE_PARAMS.items():
+        print(f"  [{typ}] dev {p['development']}wk | SIT {p['sit_runs']}x{p['sit_size']} "
+              f"({TEST_SIZES[p['sit_size']]['sit_days']}d) | E2E {p['e2e_runs']}x{p['e2e_size']} "
+              f"({TEST_SIZES[p['e2e_size']]['e2e_days']}d) | app test {p['application_test']}wk "
+              f"| inflight {p['inflight_order_test']}wk | go-live prep {p['go_live_prep']}wk")
+    for e, v in ENVIRONMENTS.items():
+        wins = "; ".join(f"{frm} to {to}" for frm, to in v["windows"])
+        print(f"  {e}: capacity={v['capacity']}, available {wins}")
 
 # ----------------------------------------------------------------------------
 #  MAIN
