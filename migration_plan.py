@@ -40,10 +40,11 @@ ACTIVITIES = {
     "Complex2": "complex",
 }
 
-# (ii)/(iii) Phase parameters per activity type.
-#   development, application_test, inflight_order_test, go_live_prep: weeks
+# (ii)/(iii)/(iv)/(v) Phase parameters per activity type.
+#   development, application_test, application_test_migrated, inflight_order_test,
+#   dress_rehearsal, fut: weeks
 #   sit_runs, e2e_runs: number of runs
-#   sit_size, e2e_size: environment footprint (small/medium/large/xlarge)
+#   sit_size, e2e_size, dress_rehearsal_size: environment footprint (small/medium/large)
 PHASE_PARAMS = {
     "simple": dict(
         development=4,          # weeks
@@ -51,28 +52,33 @@ PHASE_PARAMS = {
         sit_size="small",
         e2e_runs=1,
         e2e_size="small",
-        application_test=3,     # weeks
-        inflight_order_test=2,  # weeks, runs in parallel with application test
-        go_live_prep=2,         # weeks after readiness
+        application_test=1,                 # weeks
+        application_test_migrated=1,        # weeks, runs after application test
+        inflight_order_test=2,             # weeks, parallel with application test migrated
+        dress_rehearsal=2,                 # weeks, requires an environment
+        dress_rehearsal_size="small",
+        fut=1,                             # weeks after dress rehearsal
     ),
     "complex": dict(
         development=8,
-        sit_runs=3,
+        sit_runs=5,
         sit_size="large",
-        e2e_runs=2,
+        e2e_runs=5,
         e2e_size="medium",
-        application_test=5,
+        application_test=10,
+        application_test_migrated=10,
         inflight_order_test=4,
-        go_live_prep=3,
+        dress_rehearsal=3,
+        dress_rehearsal_size="large",
+        fut=2,
     ),
 }
 
 # (iv) Test sizes: how many days one run occupies the environment.
 TEST_SIZES = {
-    "small":  dict(sit_days=5,  e2e_days=5),
-    "medium": dict(sit_days=10, e2e_days=10),
-    "large":  dict(sit_days=15, e2e_days=15),
-    "xlarge": dict(sit_days=25, e2e_days=20),
+    "small":  dict(sit_days=2, e2e_days=2),
+    "medium": dict(sit_days=4, e2e_days=4),
+    "large":  dict(sit_days=6, e2e_days=6),
 }
 
 # (vi) Environments: name -> capacity and availability window(s).
@@ -85,6 +91,9 @@ ENVIRONMENTS = {
     "ENV-C": dict(capacity="small",  windows=[("2026-11-02", "2027-12-31")]),
     "ENV-D": dict(capacity="small",  windows=[("2027-03-01", "2027-12-31")]),
 }
+
+# Minimum separation between any two go-lives (calendar days).
+GO_LIVE_SEPARATION_DAYS = 14
 
 # Priority for environment conflicts: 1 = highest, 6 = lowest.
 # When two activities compete for the same environment slot, the lower number wins.
@@ -139,13 +148,14 @@ class ActivityPlan:
     type: str
     phases: dict = field(default_factory=dict)   # phase -> (start, end)
     runs: list = field(default_factory=list)
+    e2e_end: dt.date = None                       # end of last SIT/E2E run
     @property
     def ready(self):
-        return max(self.phases["Application test"][1],
+        return max(self.phases["Application test migrated"][1],
                    self.phases["Inflight order test"][1])
     @property
     def golive(self):
-        return self.phases["Go-live preparation"][1]
+        return self.phases["Go-live"][1]
 
 class Scheduler:
     def __init__(self):
@@ -165,10 +175,10 @@ class Scheduler:
         booked = {b for _, b in self.env_bookings[env]}
         return all(day not in booked for day in days)
 
-    def book_run(self, activity, kind, size, earliest):
+    def book_run(self, activity, kind, size, earliest, n_days=None):
         """Find earliest slot of consecutive working days in a capable, free env."""
-        n_days = TEST_SIZES[size][kind.lower().replace("e2e", "e2e") + "_days"] \
-            if kind == "SIT" else TEST_SIZES[size]["e2e_days"]
+        if n_days is None:
+            n_days = TEST_SIZES[size]["sit_days"] if kind == "SIT" else TEST_SIZES[size]["e2e_days"]
         # A run must fall inside an environment availability window, so there is
         # no point searching past the last available day of any window.
         last_available = max(d(to) for env in ENVIRONMENTS.values()
@@ -238,8 +248,10 @@ class Scheduler:
                                 e2e_size=PHASE_PARAMS[ACTIVITIES[name]]["e2e_size"])
                      for name in ACTIVITIES}
         while heap:
-            prio, ready, name, kind, size, seq = heapq.heappop(heap)
-            run = self.book_run(name, kind, size, ready)
+            entry = heapq.heappop(heap)
+            prio, ready, name, kind, size, seq = entry[:6]
+            n_days = entry[6] if len(entry) > 6 else None
+            run = self.book_run(name, kind, size, ready, n_days=n_days)
             plans[name].runs.append(run)
             # Chain the next run of this activity (SIT runs, then E2E runs)
             nxt_ready = next_workday(run.end + dt.timedelta(days=1))
@@ -250,25 +262,51 @@ class Scheduler:
                     heapq.heappush(heap, (prio, nxt_ready, name, "SIT", rem["sit_size"], seq + 1))
                 elif rem["e2e"] > 0:
                     heapq.heappush(heap, (prio, nxt_ready, name, "E2E", rem["e2e_size"], seq + 1))
-            else:
+            elif kind == "E2E":
                 rem["e2e"] -= 1
                 if rem["e2e"] > 0:
                     heapq.heappush(heap, (prio, nxt_ready, name, "E2E", rem["e2e_size"], seq + 1))
+                else:
+                    # Last SIT/E2E run done: remember it, compute readiness, and
+                    # queue the dress rehearsal (environment run) for phase 2.
+                    p = PHASE_PARAMS[ACTIVITIES[name]]
+                    a = plans[name]
+                    a.e2e_end = run.end
+                    app_start = nxt_ready
+                    app_end = add_workdays(app_start, p["application_test"] * WORKDAYS_PER_WEEK)
+                    a.phases["Application test"] = (app_start, app_end)
+                    mig_end = add_workdays(next_workday(app_end + dt.timedelta(days=1)),
+                                           p["application_test_migrated"] * WORKDAYS_PER_WEEK)
+                    a.phases["Application test migrated"] = (
+                        next_workday(app_end + dt.timedelta(days=1)), mig_end)
+                    inf_end = add_workdays(next_workday(app_end + dt.timedelta(days=1)),
+                                           p["inflight_order_test"] * WORKDAYS_PER_WEEK)
+                    a.phases["Inflight order test"] = (
+                        next_workday(app_end + dt.timedelta(days=1)), inf_end)
+                    ready = max(mig_end, inf_end)
+                    dr_weeks = p["dress_rehearsal"]
+                    heapq.heappush(heap, (prio, next_workday(ready + dt.timedelta(days=1)),
+                                          name, "DR", p["dress_rehearsal_size"], seq + 1,
+                                          dr_weeks * WORKDAYS_PER_WEEK))
 
-        # Phase 3: application test + inflight order test in parallel, then go-live prep
-        for name in ACTIVITIES:
+        # Phase 3: FUT after dress rehearsal, then go-live with separation
+        last_golive = None
+        for name in sorted(ACTIVITIES, key=prio_sort_key):
             p = PHASE_PARAMS[ACTIVITIES[name]]
             a = plans[name]
-            last_run_end = max((r.end for r in a.runs), default=a.phases["Development"][1])
-            cursor = next_workday(last_run_end + dt.timedelta(days=1))
-            app_end = add_workdays(cursor, p["application_test"] * WORKDAYS_PER_WEEK)
-            a.phases["Application test"] = (cursor, app_end)
-            inf_end = add_workdays(cursor, p["inflight_order_test"] * WORKDAYS_PER_WEEK)
-            a.phases["Inflight order test"] = (cursor, inf_end)
-            ready = max(app_end, inf_end)
-            cursor = next_workday(ready + dt.timedelta(days=1))
-            gl_end = add_workdays(cursor, p["go_live_prep"] * WORKDAYS_PER_WEEK)
-            a.phases["Go-live preparation"] = (cursor, gl_end)
+            dr_runs = [r for r in a.runs if r.kind == "DR"]
+            dr_end = max(r.end for r in dr_runs)
+            fut_start = next_workday(dr_end + dt.timedelta(days=1))
+            fut_end = add_workdays(fut_start, p["fut"] * WORKDAYS_PER_WEEK)
+            a.phases["FUT"] = (fut_start, fut_end)
+            # Go-live: earliest the next working day after FUT, but at least
+            # GO_LIVE_SEPARATION_DAYS after any previously scheduled go-live.
+            earliest = next_workday(fut_end + dt.timedelta(days=1))
+            if last_golive is not None:
+                earliest = max(earliest,
+                               next_workday(last_golive + dt.timedelta(days=GO_LIVE_SEPARATION_DAYS)))
+            a.phases["Go-live"] = (earliest, earliest)
+            last_golive = earliest
         return plans
 
 # ----------------------------------------------------------------------------
@@ -280,8 +318,11 @@ BAR_COLORS = {
     "SIT":                  "ED7D31",
     "E2E":                  "FFC000",
     "Application test":     "70AD47",
+    "Application test migrated": "9BD58A",
     "Inflight order test":  "7030A0",
-    "Go-live preparation":  "C00000",
+    "Dress rehearsal":      "E060A0",
+    "FUT":                  "C00000",
+    "Go-live":              "000000",
 }
 PHASES = list(BAR_COLORS)
 
@@ -317,17 +358,19 @@ def slide_exec_summary(prs, plans):
               "Level 1: one line per activity, key milestones")
     ordered = [plans[n] for n in sorted(ACTIVITY_PRIORITY, key=prio_sort_key) if n in plans]
     rows = len(ordered) + 1
-    table = add_table(slide, rows, 7, 0.4, 1.1, 9.2, 0.4 * rows)
-    headers = ["Activity", "Type", "Dev done", "Tests done", "Ready for migration",
-               "Go-live prep done", "Total weeks"]
+    table = add_table(slide, rows, 10, 0.4, 1.1, 9.2, 0.4 * rows)
+    headers = ["Activity", "Type", "Dev done", "Tests done", "App test done",
+               "Ready", "Dress rehearsal", "FUT done", "Go-live", "Total weeks"]
     for i, h in enumerate(headers):
         set_cell(table.cell(0, i), h, bold=True)
     for r, a in enumerate(ordered, start=1):
         total = (a.golive - PLAN_START).days / 7
         vals = [a.name, a.type,
                 fmt(a.phases["Development"][1]),
-                fmt(max(a.runs[-1].end for a in [a] if a.runs) if a.runs else PLAN_START),
-                fmt(a.ready), fmt(a.golive), f"{total:.0f}"]
+                fmt(max((x.end for x in a.runs if x.kind in ("SIT", "E2E")), default=PLAN_START)),
+                fmt(a.phases["Application test"][1]),
+                fmt(a.ready), fmt(max(x.end for x in a.runs if x.kind == "DR")),
+                fmt(a.phases["FUT"][1]), fmt(a.golive), f"{total:.0f}"]
         for c, v in enumerate(vals):
             set_cell(table.cell(r, c), v)
     return slide
@@ -464,12 +507,14 @@ def slide_assumptions(prs):
     lines = [
         f"Plan starts: {fmt(PLAN_START)}   |   Working days per week: {WORKDAYS_PER_WEEK}",
         "Per activity: Development -> SIT runs -> E2E runs -> Application test -> "
-        "Go-live preparation are sequential.",
-        "Inflight order test runs in parallel with Application test (starts same day).",
+        "Application test migrated / Inflight order test (parallel) -> Dress rehearsal "
+        "(environment) -> FUT -> Go-live are sequential.",
+        "Inflight order test runs in parallel with Application test migrated.",
         "SIT and E2E runs book a capable, available environment for consecutive working days.",
         "Environment conflicts resolve by priority (1 = highest, 6 = lowest): "
         + ", ".join(f"{n}={p}" for n, p in sorted(ACTIVITY_PRIORITY.items(), key=prio_sort_key)) + ".",
-        "Go-live preparation starts after readiness (max of application and inflight order tests).",
+        "Go-lives are separated by at least "
+        f"{GO_LIVE_SEPARATION_DAYS} days and scheduled in priority order.",
     ]
     tf.text = "\n".join(lines)
     for p in tf.paragraphs:
@@ -498,7 +543,8 @@ def print_overview(plans):
           f"({WORKDAYS_PER_WEEK} working days/week)")
     print("=" * 100)
     hdr = f"  {'Activity':<10s} {'Prio':<4s} {'Type':<8s} {'Start':<10s} {'Dev done':<10s} " \
-          f"{'SIT done':<10s} {'E2E done':<10s} {'Ready':<10s} {'Go-live done':<12s} {'Weeks':>5s}"
+          f"{'SIT done':<10s} {'E2E done':<10s} {'App done':<10s} {'AppMig done':<10s} " \
+          f"{'Ready':<10s} {'DR done':<10s} {'FUT done':<10s} {'Go-live':<12s} {'Weeks':>5s}"
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     for name in sorted(ACTIVITY_PRIORITY, key=prio_sort_key):
@@ -512,7 +558,10 @@ def print_overview(plans):
         weeks = (a.golive - start).days // 7
         print(f"  {a.name:<10s} {ACTIVITY_PRIORITY.get(name, '?'):<4d} {a.type:<8s} {fmt(start):<10s} "
               f"{fmt(a.phases['Development'][1]):<10s} {last_end('SIT'):<10s} {last_end('E2E'):<10s} "
-              f"{fmt(a.ready):<10s} {fmt(a.golive):<12s} {weeks:>4d}")
+              f"{fmt(a.phases['Application test'][1]):<10s} "
+              f"{fmt(a.phases['Application test migrated'][1]):<10s} "
+              f"{fmt(a.ready):<10s} {last_end('DR'):<10s} {fmt(a.phases['FUT'][1]):<10s} "
+              f"{fmt(a.golive):<12s} {weeks:>4d}")
     # Horizon check
     late = [a.name for a in plans.values() if a.golive > PLAN_END]
     if late:
@@ -536,7 +585,7 @@ def print_plans(plans, sched):
         for run in a.runs:
             print(f"  {run.kind} {run.size:8s} @ {run.env:6s} {fmt(run.start)} -> {fmt(run.end)}")
         print(f"  {'Ready for migration':24s} {fmt(a.ready)}")
-        print(f"  {'Go-live prep complete':24s} {fmt(a.golive)}")
+        print(f"  {'Go-live':24s} {fmt(a.golive)}")
     print("\nEnvironment bookings:")
     for e in sorted(sched.env_bookings):
         print(f"  {e}: {len(sched.env_bookings[e])} days booked")
@@ -549,7 +598,9 @@ def print_plans(plans, sched):
         print(f"  [{typ}] dev {p['development']}wk | SIT {p['sit_runs']}x{p['sit_size']} "
               f"({TEST_SIZES[p['sit_size']]['sit_days']}d) | E2E {p['e2e_runs']}x{p['e2e_size']} "
               f"({TEST_SIZES[p['e2e_size']]['e2e_days']}d) | app test {p['application_test']}wk "
-              f"| inflight {p['inflight_order_test']}wk | go-live prep {p['go_live_prep']}wk")
+              f"| app test migrated {p['application_test_migrated']}wk "
+              f"| inflight {p['inflight_order_test']}wk | dress rehearsal {p['dress_rehearsal']}wk "
+              f"({p['dress_rehearsal_size']}) | FUT {p['fut']}wk")
     for e, v in ENVIRONMENTS.items():
         wins = "; ".join(f"{frm} to {to}" for frm, to in v["windows"])
         print(f"  {e}: capacity={v['capacity']}, available {wins}")
