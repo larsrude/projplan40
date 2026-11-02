@@ -266,13 +266,17 @@ class Scheduler:
         plans = {}
         heap = []   # entries: (prio, ready_date, name, kind, size, run_seq)
 
-        # Phase 1: development phases are unconstrained (no environment needed)
+        # Phase 1: development and application test are unconstrained
+        # (no environment needed). The application test has no dependency on the
+        # migration work: it starts at the plan start and can run whenever.
         for name in ACTIVITIES:
             p = PHASE_PARAMS[ACTIVITIES[name]]
             a = ActivityPlan(name, ACTIVITIES[name])
             start = next_workday(PLAN_START)
             end = add_workdays(start, p["development"] * WORKDAYS_PER_WEEK)
             a.phases["Development"] = (start, end)
+            app_end = add_workdays(start, p["application_test"] * WORKDAYS_PER_WEEK)
+            a.phases["Application test"] = (start, app_end)
             plans[name] = a
             # First run (SIT) becomes ready the day after development ends
             if p["sit_runs"]:
@@ -314,25 +318,22 @@ class Scheduler:
                 if rem["e2e"] > 0:
                     heapq.heappush(heap, (prio, nxt_ready, name, "E2E", rem["e2e_size"], seq + 1))
                 else:
-                    # Last SIT/E2E run done: remember it, compute readiness, and
-                    # queue the dress rehearsal (environment run) for phase 2.
+                    # Last SIT/E2E run done: the application test MIGRATED and
+                    # the inflight order test both depend on the migration runs
+                    # (E2E) and run in parallel with each other. Their common
+                    # start is the first working day after both the application
+                    # test and the last migration run have finished.
                     p = PHASE_PARAMS[ACTIVITIES[name]]
                     a = plans[name]
                     a.e2e_end = run.end
-                    # The break applies between environment RUNS only; the
-                    # application test starts the next working day after the
-                    # last run, without an extra break.
-                    app_start = next_workday(run.end + dt.timedelta(days=1))
-                    app_end = add_workdays(app_start, p["application_test"] * WORKDAYS_PER_WEEK)
-                    a.phases["Application test"] = (app_start, app_end)
-                    mig_end = add_workdays(next_workday(app_end + dt.timedelta(days=1)),
+                    app_test_end = a.phases["Application test"][1]
+                    common_start = next_workday(max(app_test_end, run.end) + dt.timedelta(days=1))
+                    mig_end = add_workdays(common_start,
                                            p["application_test_migrated"] * WORKDAYS_PER_WEEK)
-                    a.phases["Application test migrated"] = (
-                        next_workday(app_end + dt.timedelta(days=1)), mig_end)
-                    inf_end = add_workdays(next_workday(app_end + dt.timedelta(days=1)),
+                    a.phases["Application test migrated"] = (common_start, mig_end)
+                    inf_end = add_workdays(common_start,
                                            p["inflight_order_test"] * WORKDAYS_PER_WEEK)
-                    a.phases["Inflight order test"] = (
-                        next_workday(app_end + dt.timedelta(days=1)), inf_end)
+                    a.phases["Inflight order test"] = (common_start, inf_end)
                     ready = max(mig_end, inf_end)
                     heapq.heappush(heap, (prio, next_workday(ready + dt.timedelta(days=1)),
                                           name, "DR", p["dress_rehearsal_size"], seq + 1,
