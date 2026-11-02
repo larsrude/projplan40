@@ -123,8 +123,32 @@ def prio_sort_key(name):
 def d(s):
     return dt.date.fromisoformat(s)
 
+# Blocked periods: recurring annually, given as (from "MM-DD", to "MM-DD").
+# A range may wrap the year end (e.g. Christmas 23-Dec to 2-Jan).
+BLOCKED_PERIODS = [
+    ("12-23", "01-02"),   # Christmas / New Year
+    ("03-20", "03-29"),   # Easter
+    ("07-05", "07-25"),   # 3-week summer break in July (weeks 28-30)
+]
+
+def _mday(day):
+    return (day.month, day.day)
+
+def is_blocked(day):
+    m, d = day.month, day.day
+    for frm, to in BLOCKED_PERIODS:
+        fm, fd = int(frm.split("-")[0]), int(frm.split("-")[1])
+        tm, td = int(to.split("-")[0]), int(to.split("-")[1])
+        if (fm, fd) <= (tm, td):                       # normal range
+            if (fm, fd) <= (m, d) <= (tm, td):
+                return True
+        else:                                         # wraps year end
+            if (m, d) >= (fm, fd) or (m, d) <= (tm, td):
+                return True
+    return False
+
 def is_workday(day):
-    return day.weekday() < WORKDAYS_PER_WEEK
+    return day.weekday() < WORKDAYS_PER_WEEK and not is_blocked(day)
 
 def next_workday(day):
     while not is_workday(day):
@@ -295,7 +319,10 @@ class Scheduler:
                     p = PHASE_PARAMS[ACTIVITIES[name]]
                     a = plans[name]
                     a.e2e_end = run.end
-                    app_start = nxt_ready
+                    # The break applies between environment RUNS only; the
+                    # application test starts the next working day after the
+                    # last run, without an extra break.
+                    app_start = next_workday(run.end + dt.timedelta(days=1))
                     app_end = add_workdays(app_start, p["application_test"] * WORKDAYS_PER_WEEK)
                     a.phases["Application test"] = (app_start, app_end)
                     mig_end = add_workdays(next_workday(app_end + dt.timedelta(days=1)),
@@ -540,6 +567,8 @@ def slide_assumptions(prs):
         + ", ".join(f"{n}={p}" for n, p in sorted(ACTIVITY_PRIORITY.items(), key=prio_sort_key)) + ".",
         "Go-lives are separated by at least "
         f"{GO_LIVE_SEPARATION_DAYS} days and scheduled in priority order.",
+        "Blocked periods (recurring annually): "
+        + ", ".join(f"{frm} to {to}" for frm, to in BLOCKED_PERIODS) + ".",
     ]
     tf.text = "\n".join(lines)
     for p in tf.paragraphs:
