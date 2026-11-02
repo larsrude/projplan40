@@ -42,7 +42,7 @@ ACTIVITIES = {
 
 # (ii)/(iii)/(iv)/(v) Phase parameters per activity type.
 #   development, application_test, application_test_migrated, inflight_order_test,
-#   dress_rehearsal, fut: weeks
+#   fut: weeks; dress_rehearsal_days: working days
 #   sit_runs, e2e_runs: number of runs
 #   sit_size, e2e_size, dress_rehearsal_size: environment footprint (small/medium/large)
 PHASE_PARAMS = {
@@ -55,7 +55,7 @@ PHASE_PARAMS = {
         application_test=1,                 # weeks
         application_test_migrated=1,        # weeks, runs after application test
         inflight_order_test=2,             # weeks, parallel with application test migrated
-        dress_rehearsal=2,                 # weeks, requires an environment
+        dress_rehearsal_days=3,            # working days, requires an environment
         dress_rehearsal_size="small",
         fut=1,                             # weeks after dress rehearsal
     ),
@@ -68,7 +68,7 @@ PHASE_PARAMS = {
         application_test=10,
         application_test_migrated=10,
         inflight_order_test=4,
-        dress_rehearsal=3,
+        dress_rehearsal_days=3,
         dress_rehearsal_size="large",
         fut=2,
     ),
@@ -92,10 +92,13 @@ ENVIRONMENTS = {
     "ENV-D": dict(capacity="small",  windows=[("2027-03-01", "2027-12-31")]),
 }
 
-# Minimum break (calendar days) between the end of one run and the start of the
-# next run of an activity, by run kind. A SIT run is followed by >= 2 days break,
-# an E2E run by >= 3 days break (before the next SIT/E2E/DR run of that activity).
-RUN_BREAK_DAYS = {"SIT": 2, "E2E": 3, "DR": 0}
+# Minimum break (WORKING days) between the end of one run and the start of the
+# next run of an activity, by run kind: after a SIT run >= 2 working days,
+# after an E2E run >= 3 working days (before the next SIT/E2E/DR run).
+RUN_BREAK_WORKDAYS = {"SIT": 2, "E2E": 3, "DR": 0}
+
+# Minimum separation between any two dress rehearsals (working days, i.e. a week).
+DR_SEPARATION_WORKDAYS = 5
 
 # Minimum separation between any two go-lives (calendar days).
 GO_LIVE_SEPARATION_DAYS = 14
@@ -137,6 +140,14 @@ def add_workdays(start, n):
         day = next_workday(day)
         count += 1
     return day
+
+def after_break(end, break_workdays):
+    """First working day after 'end' with at least 'break_workdays' clear
+    working days in between (break 0 -> simply the next working day)."""
+    day = end
+    for _ in range(break_workdays):
+        day = next_workday(day + dt.timedelta(days=1))
+    return next_workday(day + dt.timedelta(days=1))
 
 @dataclass
 class Run:
@@ -252,16 +263,21 @@ class Scheduler:
                                 sit_size=PHASE_PARAMS[ACTIVITIES[name]]["sit_size"],
                                 e2e_size=PHASE_PARAMS[ACTIVITIES[name]]["e2e_size"])
                      for name in ACTIVITIES}
+        last_dr_end = None
         while heap:
             entry = heapq.heappop(heap)
             prio, ready, name, kind, size, seq = entry[:6]
             n_days = entry[6] if len(entry) > 6 else None
+            if kind == "DR" and last_dr_end is not None:
+                # Dress rehearsals are separated by at least a week (working days)
+                ready = max(ready, after_break(last_dr_end, DR_SEPARATION_WORKDAYS))
             run = self.book_run(name, kind, size, ready, n_days=n_days)
+            if kind == "DR":
+                last_dr_end = run.end
             plans[name].runs.append(run)
             # Chain the next run of this activity (SIT runs, then E2E runs),
             # honouring the minimum break after this run's kind.
-            break_days = RUN_BREAK_DAYS.get(kind, 0)
-            nxt_ready = next_workday(run.end + dt.timedelta(days=1 + break_days))
+            nxt_ready = after_break(run.end, RUN_BREAK_WORKDAYS.get(kind, 0))
             rem = remaining[name]
             if kind == "SIT":
                 rem["sit"] -= 1
@@ -291,10 +307,9 @@ class Scheduler:
                     a.phases["Inflight order test"] = (
                         next_workday(app_end + dt.timedelta(days=1)), inf_end)
                     ready = max(mig_end, inf_end)
-                    dr_weeks = p["dress_rehearsal"]
                     heapq.heappush(heap, (prio, next_workday(ready + dt.timedelta(days=1)),
                                           name, "DR", p["dress_rehearsal_size"], seq + 1,
-                                          dr_weeks * WORKDAYS_PER_WEEK))
+                                          p["dress_rehearsal_days"]))
 
         # Phase 3: FUT after dress rehearsal, then go-live with separation
         last_golive = None
@@ -519,7 +534,8 @@ def slide_assumptions(prs):
         "Inflight order test runs in parallel with Application test migrated.",
         "SIT and E2E runs book a capable, available environment for consecutive working days.",
         "Minimum break between runs of an activity: "
-        + ", ".join(f"{k} {v}d" for k, v in RUN_BREAK_DAYS.items() if v) + ".",
+        + ", ".join(f"{k} {v}wd" for k, v in RUN_BREAK_WORKDAYS.items() if v)
+        + f"; dress rehearsals separated by {DR_SEPARATION_WORKDAYS} working days.",
         "Environment conflicts resolve by priority (1 = highest, 6 = lowest): "
         + ", ".join(f"{n}={p}" for n, p in sorted(ACTIVITY_PRIORITY.items(), key=prio_sort_key)) + ".",
         "Go-lives are separated by at least "
