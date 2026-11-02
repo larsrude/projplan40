@@ -16,6 +16,7 @@ Run:  python3 migration_plan.py            -> writes migration_plan.pptx
 
 import argparse
 import datetime as dt
+import heapq
 from dataclasses import dataclass, field
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -25,8 +26,9 @@ from pptx.util import Inches, Pt, Emu
 #  PARAMETER TABLES  (edit these to change the plan)
 # ----------------------------------------------------------------------------
 
-PLAN_START = dt.date(2025, 1, 6)   # first working day of the plan
-WORKDAYS_PER_WEEK = 5              # only 5 days a week are used
+PLAN_START = dt.date(2026, 11, 1)   # first working day of the plan
+PLAN_END   = dt.date(2027, 12, 31) # last day of the planning horizon
+WORKDAYS_PER_WEEK = 5               # only 5 days a week are used
 
 # (i) Migration activities: name -> type. Types carry default durations.
 ACTIVITIES = {
@@ -38,39 +40,45 @@ ACTIVITIES = {
     "Complex2": "complex",
 }
 
-# (ii)/(iii) Phase parameters per activity type.
-#   development, application_test, inflight_order_test, go_live_prep: weeks
+# (ii)/(iii)/(iv)/(v) Phase parameters per activity type.
+#   development, application_test, application_test_migrated, inflight_order_test,
+#   fut: weeks; dress_rehearsal_days: working days
 #   sit_runs, e2e_runs: number of runs
-#   sit_size, e2e_size: environment footprint (small/medium/large/xlarge)
+#   sit_size, e2e_size, dress_rehearsal_size: environment footprint (small/medium/large)
 PHASE_PARAMS = {
     "simple": dict(
         development=4,          # weeks
         sit_runs=2,
         sit_size="small",
         e2e_runs=1,
-        e2e_size="small",
-        application_test=3,     # weeks
-        inflight_order_test=2,  # weeks, runs in parallel with application test
-        go_live_prep=2,         # weeks after readiness
+        e2e_size="medium",
+        application_test=1,                 # weeks
+        application_test_migrated=1,        # weeks, runs after application test
+        inflight_order_test=2,             # weeks, parallel with application test migrated
+        dress_rehearsal_days=3,            # working days, requires an environment
+        dress_rehearsal_size="small",
+        fut=1,                             # weeks after dress rehearsal
     ),
     "complex": dict(
         development=8,
-        sit_runs=3,
-        sit_size="large",
-        e2e_runs=2,
-        e2e_size="medium",
-        application_test=5,
+        sit_runs=5,
+        sit_size="medium",
+        e2e_runs=5,
+        e2e_size="large",
+        application_test=10,
+        application_test_migrated=10,
         inflight_order_test=4,
-        go_live_prep=3,
+        dress_rehearsal_days=3,
+        dress_rehearsal_size="large",
+        fut=2,
     ),
 }
 
 # (iv) Test sizes: how many days one run occupies the environment.
 TEST_SIZES = {
-    "small":  dict(sit_days=5,  e2e_days=5),
-    "medium": dict(sit_days=10, e2e_days=10),
-    "large":  dict(sit_days=15, e2e_days=15),
-    "xlarge": dict(sit_days=25, e2e_days=20),
+    "small":  dict(sit_days=2, e2e_days=2),
+    "medium": dict(sit_days=4, e2e_days=4),
+    "large":  dict(sit_days=6, e2e_days=6),
 }
 
 # (vi) Environments: name -> capacity and availability window(s).
@@ -78,14 +86,35 @@ TEST_SIZES = {
 #             "all"    = can take any size run.
 #   windows:  list of (from_date, to_date) inclusive availability periods.
 ENVIRONMENTS = {
-    "ENV-A": dict(capacity="all",    windows=[("2025-01-06", "2025-12-31")]),
-    "ENV-B": dict(capacity="all",    windows=[("2025-03-03", "2025-12-31")]),
-    "ENV-C": dict(capacity="small",  windows=[("2025-01-06", "2025-06-30")]),
-    "ENV-D": dict(capacity="small",  windows=[("2025-02-03", "2025-09-30")]),
+    "ENV-A": dict(capacity="all",    windows=[("2026-11-02", "2027-12-31")]),
+    "ENV-B": dict(capacity="all",    windows=[("2027-03-01", "2027-12-31")]),
+    "ENV-C": dict(capacity="small",  windows=[("2026-11-02", "2027-12-31")]),
+    "ENV-D": dict(capacity="small",  windows=[("2027-03-01", "2027-12-31")]),
 }
 
-# Priority order in which activities compete for environments.
-ACTIVITY_PRIORITY = ["Complex1", "Complex2", "Simple1", "Simple2", "Simple3", "Simple4"]
+# Minimum break (WORKING days) between the end of one run and the start of the
+# next run of an activity, by run kind: after a SIT run >= 2 working days,
+# after an E2E run >= 3 working days (before the next SIT/E2E/DR run).
+RUN_BREAK_WORKDAYS = {"SIT": 2, "E2E": 3, "DR": 0}
+
+# Minimum separation between any two dress rehearsals (working days, i.e. a week).
+DR_SEPARATION_WORKDAYS = 5
+
+# Minimum separation between any two go-lives (calendar days).
+GO_LIVE_SEPARATION_DAYS = 14
+
+# Priority for environment conflicts: 1 = highest, 6 = lowest.
+# When two activities compete for the same environment slot, the lower number wins.
+# Ties are broken deterministically: earliest-ready run first, then activity name.
+ACTIVITY_PRIORITY = {
+    "Simple1": 1, "Simple2": 1,
+    "Simple3": 3, "Simple4": 3,
+    "Complex1": 5, "Complex2": 5,
+}
+
+def prio_sort_key(name):
+    """Sort activities by priority (1 first), ties by name for stable output."""
+    return (ACTIVITY_PRIORITY.get(name, 99), name)
 
 # ----------------------------------------------------------------------------
 #  SCHEDULER
@@ -94,8 +123,32 @@ ACTIVITY_PRIORITY = ["Complex1", "Complex2", "Simple1", "Simple2", "Simple3", "S
 def d(s):
     return dt.date.fromisoformat(s)
 
+# Blocked periods: recurring annually, given as (from "MM-DD", to "MM-DD").
+# A range may wrap the year end (e.g. Christmas 23-Dec to 2-Jan).
+BLOCKED_PERIODS = [
+    ("12-23", "01-02"),   # Christmas / New Year
+    ("03-20", "03-29"),   # Easter
+    ("07-05", "07-25"),   # 3-week summer break in July (weeks 28-30)
+]
+
+def _mday(day):
+    return (day.month, day.day)
+
+def is_blocked(day):
+    m, d = day.month, day.day
+    for frm, to in BLOCKED_PERIODS:
+        fm, fd = int(frm.split("-")[0]), int(frm.split("-")[1])
+        tm, td = int(to.split("-")[0]), int(to.split("-")[1])
+        if (fm, fd) <= (tm, td):                       # normal range
+            if (fm, fd) <= (m, d) <= (tm, td):
+                return True
+        else:                                         # wraps year end
+            if (m, d) >= (fm, fd) or (m, d) <= (tm, td):
+                return True
+    return False
+
 def is_workday(day):
-    return day.weekday() < WORKDAYS_PER_WEEK
+    return day.weekday() < WORKDAYS_PER_WEEK and not is_blocked(day)
 
 def next_workday(day):
     while not is_workday(day):
@@ -112,6 +165,14 @@ def add_workdays(start, n):
         count += 1
     return day
 
+def after_break(end, break_workdays):
+    """First working day after 'end' with at least 'break_workdays' clear
+    working days in between (break 0 -> simply the next working day)."""
+    day = end
+    for _ in range(break_workdays):
+        day = next_workday(day + dt.timedelta(days=1))
+    return next_workday(day + dt.timedelta(days=1))
+
 @dataclass
 class Run:
     activity: str
@@ -127,13 +188,14 @@ class ActivityPlan:
     type: str
     phases: dict = field(default_factory=dict)   # phase -> (start, end)
     runs: list = field(default_factory=list)
+    e2e_end: dt.date = None                       # end of last SIT/E2E run
     @property
     def ready(self):
-        return max(self.phases["Application test"][1],
+        return max(self.phases["Application test migrated"][1],
                    self.phases["Inflight order test"][1])
     @property
     def golive(self):
-        return self.phases["Go-live preparation"][1]
+        return self.phases["Go-live"][1]
 
 class Scheduler:
     def __init__(self):
@@ -153,12 +215,16 @@ class Scheduler:
         booked = {b for _, b in self.env_bookings[env]}
         return all(day not in booked for day in days)
 
-    def book_run(self, activity, kind, size, earliest):
+    def book_run(self, activity, kind, size, earliest, n_days=None):
         """Find earliest slot of consecutive working days in a capable, free env."""
-        n_days = TEST_SIZES[size][kind.lower().replace("e2e", "e2e") + "_days"] \
-            if kind == "SIT" else TEST_SIZES[size]["e2e_days"]
+        if n_days is None:
+            n_days = TEST_SIZES[size]["sit_days"] if kind == "SIT" else TEST_SIZES[size]["e2e_days"]
+        # A run must fall inside an environment availability window, so there is
+        # no point searching past the last available day of any window.
+        last_available = max(d(to) for env in ENVIRONMENTS.values()
+                             for _, to in env["windows"])
         day = next_workday(earliest)
-        while True:
+        while day <= last_available:
             days = []
             cur = day
             for _ in range(n_days):
@@ -177,46 +243,120 @@ class Scheduler:
                 self.runs.append(run)
                 return run
             day = next_workday(day + dt.timedelta(days=1))
+        # Search deadline reached without a slot: explain why instead of looping forever.
+        capable = [e for e in ENVIRONMENTS
+                   if ENVIRONMENTS[e]["capacity"] == "all" or size == "small"]
+        raise RuntimeError(
+            f"Cannot schedule {kind} run ({size}, {n_days} days) for {activity}: "
+            f"no capable, available, free environment was found before "
+            f"{fmt(last_available)} (the last day of any environment window). "
+            f"Capable environments by size: {capable or 'none'}. "
+            f"Check ENVIRONMENTS windows/capacity, TEST_SIZES, PLAN_START and the "
+            f"number of runs in PHASE_PARAMS.")
 
     def plan(self):
+        """Schedule all activities.
+
+        Runs from all activities compete globally for environments. Runs are
+        booked in priority order (1 = highest); within the same priority, the
+        run that is ready earliest books first, ties broken by activity name.
+        A run's earliest start is the day after its activity's previous phase/run
+        ends (development -> SIT runs -> E2E runs are sequential per activity).
+        """
         plans = {}
-        for name in ACTIVITY_PRIORITY:
-            if name not in ACTIVITIES:
-                continue
+        heap = []   # entries: (prio, ready_date, name, kind, size, run_seq)
+
+        # Phase 1: development and application test are unconstrained
+        # (no environment needed). The application test has no dependency on the
+        # migration work: it starts at the plan start and can run whenever.
+        for name in ACTIVITIES:
             p = PHASE_PARAMS[ACTIVITIES[name]]
             a = ActivityPlan(name, ACTIVITIES[name])
-            cursor = PLAN_START
-
-            # Development (weeks)
-            end = add_workdays(cursor, p["development"] * WORKDAYS_PER_WEEK)
-            a.phases["Development"] = (cursor, end)
-            cursor = end + dt.timedelta(days=1)
-
-            # SIT runs (sequential, environment constrained)
-            for _ in range(p["sit_runs"]):
-                run = self.book_run(name, "SIT", p["sit_size"], cursor)
-                a.runs.append(run)
-                cursor = run.end + dt.timedelta(days=1)
-
-            # End-to-end test runs (sequential, environment constrained)
-            for _ in range(p["e2e_runs"]):
-                run = self.book_run(name, "E2E", p["e2e_size"], cursor)
-                a.runs.append(run)
-                cursor = run.end + dt.timedelta(days=1)
-
-            # Application test and inflight order test in parallel
-            app_end = add_workdays(cursor, p["application_test"] * WORKDAYS_PER_WEEK)
-            a.phases["Application test"] = (cursor, app_end)
-            inf_end = add_workdays(cursor, p["inflight_order_test"] * WORKDAYS_PER_WEEK)
-            a.phases["Inflight order test"] = (cursor, inf_end)
-
-            # Go-live preparation after readiness
-            ready = max(app_end, inf_end)
-            cursor = next_workday(ready + dt.timedelta(days=1))
-            gl_end = add_workdays(cursor, p["go_live_prep"] * WORKDAYS_PER_WEEK)
-            a.phases["Go-live preparation"] = (cursor, gl_end)
-
+            start = next_workday(PLAN_START)
+            end = add_workdays(start, p["development"] * WORKDAYS_PER_WEEK)
+            a.phases["Development"] = (start, end)
+            app_end = add_workdays(start, p["application_test"] * WORKDAYS_PER_WEEK)
+            a.phases["Application test"] = (start, app_end)
             plans[name] = a
+            # First run (SIT) becomes ready the day after development ends
+            if p["sit_runs"]:
+                heap.append((ACTIVITY_PRIORITY.get(name, 99),
+                             next_workday(end + dt.timedelta(days=1)),
+                             name, "SIT", p["sit_size"], 1))
+        heapq.heapify(heap)
+
+        # Phase 2: book environment runs in global priority order
+        remaining = {name: dict(sit=PHASE_PARAMS[ACTIVITIES[name]]["sit_runs"],
+                                e2e=PHASE_PARAMS[ACTIVITIES[name]]["e2e_runs"],
+                                sit_size=PHASE_PARAMS[ACTIVITIES[name]]["sit_size"],
+                                e2e_size=PHASE_PARAMS[ACTIVITIES[name]]["e2e_size"])
+                     for name in ACTIVITIES}
+        last_dr_end = None
+        while heap:
+            entry = heapq.heappop(heap)
+            prio, ready, name, kind, size, seq = entry[:6]
+            n_days = entry[6] if len(entry) > 6 else None
+            if kind == "DR" and last_dr_end is not None:
+                # Dress rehearsals are separated by at least a week (working days)
+                ready = max(ready, after_break(last_dr_end, DR_SEPARATION_WORKDAYS))
+            run = self.book_run(name, kind, size, ready, n_days=n_days)
+            if kind == "DR":
+                last_dr_end = run.end
+            plans[name].runs.append(run)
+            # Chain the next run of this activity (SIT runs, then E2E runs),
+            # honouring the minimum break after this run's kind.
+            nxt_ready = after_break(run.end, RUN_BREAK_WORKDAYS.get(kind, 0))
+            rem = remaining[name]
+            if kind == "SIT":
+                rem["sit"] -= 1
+                if rem["sit"] > 0:
+                    heapq.heappush(heap, (prio, nxt_ready, name, "SIT", rem["sit_size"], seq + 1))
+                elif rem["e2e"] > 0:
+                    heapq.heappush(heap, (prio, nxt_ready, name, "E2E", rem["e2e_size"], seq + 1))
+            elif kind == "E2E":
+                rem["e2e"] -= 1
+                if rem["e2e"] > 0:
+                    heapq.heappush(heap, (prio, nxt_ready, name, "E2E", rem["e2e_size"], seq + 1))
+                else:
+                    # Last SIT/E2E run done: the application test MIGRATED and
+                    # the inflight order test both depend on the migration runs
+                    # (E2E) and run in parallel with each other. Their common
+                    # start is the first working day after both the application
+                    # test and the last migration run have finished.
+                    p = PHASE_PARAMS[ACTIVITIES[name]]
+                    a = plans[name]
+                    a.e2e_end = run.end
+                    app_test_end = a.phases["Application test"][1]
+                    common_start = next_workday(max(app_test_end, run.end) + dt.timedelta(days=1))
+                    mig_end = add_workdays(common_start,
+                                           p["application_test_migrated"] * WORKDAYS_PER_WEEK)
+                    a.phases["Application test migrated"] = (common_start, mig_end)
+                    inf_end = add_workdays(common_start,
+                                           p["inflight_order_test"] * WORKDAYS_PER_WEEK)
+                    a.phases["Inflight order test"] = (common_start, inf_end)
+                    ready = max(mig_end, inf_end)
+                    heapq.heappush(heap, (prio, next_workday(ready + dt.timedelta(days=1)),
+                                          name, "DR", p["dress_rehearsal_size"], seq + 1,
+                                          p["dress_rehearsal_days"]))
+
+        # Phase 3: FUT after dress rehearsal, then go-live with separation
+        last_golive = None
+        for name in sorted(ACTIVITIES, key=prio_sort_key):
+            p = PHASE_PARAMS[ACTIVITIES[name]]
+            a = plans[name]
+            dr_runs = [r for r in a.runs if r.kind == "DR"]
+            dr_end = max(r.end for r in dr_runs)
+            fut_start = next_workday(dr_end + dt.timedelta(days=1))
+            fut_end = add_workdays(fut_start, p["fut"] * WORKDAYS_PER_WEEK)
+            a.phases["FUT"] = (fut_start, fut_end)
+            # Go-live: earliest the next working day after FUT, but at least
+            # GO_LIVE_SEPARATION_DAYS after any previously scheduled go-live.
+            earliest = next_workday(fut_end + dt.timedelta(days=1))
+            if last_golive is not None:
+                earliest = max(earliest,
+                               next_workday(last_golive + dt.timedelta(days=GO_LIVE_SEPARATION_DAYS)))
+            a.phases["Go-live"] = (earliest, earliest)
+            last_golive = earliest
         return plans
 
 # ----------------------------------------------------------------------------
@@ -228,8 +368,11 @@ BAR_COLORS = {
     "SIT":                  "ED7D31",
     "E2E":                  "FFC000",
     "Application test":     "70AD47",
+    "Application test migrated": "9BD58A",
     "Inflight order test":  "7030A0",
-    "Go-live preparation":  "C00000",
+    "Dress rehearsal":      "E060A0",
+    "FUT":                  "C00000",
+    "Go-live":              "000000",
 }
 PHASES = list(BAR_COLORS)
 
@@ -263,19 +406,21 @@ def slide_exec_summary(prs, plans):
     slide = prs.slides.add_slide(prs.slide_layouts[5])
     add_title(slide, "Migration Plan - Executive Summary",
               "Level 1: one line per activity, key milestones")
-    ordered = [plans[n] for n in ACTIVITY_PRIORITY if n in plans]
+    ordered = [plans[n] for n in sorted(ACTIVITY_PRIORITY, key=prio_sort_key) if n in plans]
     rows = len(ordered) + 1
-    table = add_table(slide, rows, 7, 0.4, 1.1, 9.2, 0.4 * rows)
-    headers = ["Activity", "Type", "Dev done", "Tests done", "Ready for migration",
-               "Go-live prep done", "Total weeks"]
+    table = add_table(slide, rows, 10, 0.4, 1.1, 9.2, 0.4 * rows)
+    headers = ["Activity", "Type", "Dev done", "Tests done", "App test done",
+               "Ready", "Dress rehearsal", "FUT done", "Go-live", "Total weeks"]
     for i, h in enumerate(headers):
         set_cell(table.cell(0, i), h, bold=True)
     for r, a in enumerate(ordered, start=1):
         total = (a.golive - PLAN_START).days / 7
         vals = [a.name, a.type,
                 fmt(a.phases["Development"][1]),
-                fmt(max(a.runs[-1].end for a in [a] if a.runs) if a.runs else PLAN_START),
-                fmt(a.ready), fmt(a.golive), f"{total:.0f}"]
+                fmt(max((x.end for x in a.runs if x.kind in ("SIT", "E2E")), default=PLAN_START)),
+                fmt(a.phases["Application test"][1]),
+                fmt(a.ready), fmt(max(x.end for x in a.runs if x.kind == "DR")),
+                fmt(a.phases["FUT"][1]), fmt(a.golive), f"{total:.0f}"]
         for c, v in enumerate(vals):
             set_cell(table.cell(r, c), v)
     return slide
@@ -412,11 +557,19 @@ def slide_assumptions(prs):
     lines = [
         f"Plan starts: {fmt(PLAN_START)}   |   Working days per week: {WORKDAYS_PER_WEEK}",
         "Per activity: Development -> SIT runs -> E2E runs -> Application test -> "
-        "Go-live preparation are sequential.",
-        "Inflight order test runs in parallel with Application test (starts same day).",
-        "SIT and E2E runs book a capable, available environment for consecutive working days;",
-        "activities are scheduled in priority order: " + ", ".join(ACTIVITY_PRIORITY) + ".",
-        "Go-live preparation starts after readiness (max of application and inflight order tests).",
+        "Application test migrated / Inflight order test (parallel) -> Dress rehearsal "
+        "(environment) -> FUT -> Go-live are sequential.",
+        "Inflight order test runs in parallel with Application test migrated.",
+        "SIT and E2E runs book a capable, available environment for consecutive working days.",
+        "Minimum break between runs of an activity: "
+        + ", ".join(f"{k} {v}wd" for k, v in RUN_BREAK_WORKDAYS.items() if v)
+        + f"; dress rehearsals separated by {DR_SEPARATION_WORKDAYS} working days.",
+        "Environment conflicts resolve by priority (1 = highest, 6 = lowest): "
+        + ", ".join(f"{n}={p}" for n, p in sorted(ACTIVITY_PRIORITY.items(), key=prio_sort_key)) + ".",
+        "Go-lives are separated by at least "
+        f"{GO_LIVE_SEPARATION_DAYS} days and scheduled in priority order.",
+        "Blocked periods (recurring annually): "
+        + ", ".join(f"{frm} to {to}" for frm, to in BLOCKED_PERIODS) + ".",
     ]
     tf.text = "\n".join(lines)
     for p in tf.paragraphs:
@@ -427,7 +580,7 @@ def build_deck(plans, sched, path):
     prs.slide_width = Inches(10)
     prs.slide_height = Inches(7.5)
     slide_exec_summary(prs, plans)
-    for name in ACTIVITY_PRIORITY:
+    for name in sorted(ACTIVITY_PRIORITY, key=prio_sort_key):
         if name in plans:
             slide_activity(prs, plans[name])
     slide_env_utilization(prs, sched)
@@ -438,15 +591,102 @@ def build_deck(plans, sched, path):
 #  TEXT OUTPUT (console)
 # ----------------------------------------------------------------------------
 
-def print_plans(plans, sched):
+def print_overview(plans):
+    """Level 1 - one line per activity, key milestones."""
     print("=" * 100)
-    print("MIGRATION PLAN  (start %s, %d working days/week)" % (fmt(PLAN_START), WORKDAYS_PER_WEEK))
+    print(f"MIGRATION PLAN OVERVIEW   horizon: {fmt(PLAN_START)} -> {fmt(PLAN_END)}   "
+          f"({WORKDAYS_PER_WEEK} working days/week)")
     print("=" * 100)
-    for name in ACTIVITY_PRIORITY:
+    hdr = f"  {'Activity':<10s} {'Prio':<4s} {'Type':<8s} {'Start':<10s} {'Dev done':<10s} " \
+          f"{'SIT done':<10s} {'E2E done':<10s} {'App done':<10s} {'AppMig done':<10s} " \
+          f"{'Ready':<10s} {'DR done':<10s} {'FUT done':<10s} {'Go-live':<12s} {'Weeks':>5s}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for name in sorted(ACTIVITY_PRIORITY, key=prio_sort_key):
         if name not in plans:
             continue
         a = plans[name]
-        print(f"\n--- {a.name} ({a.type}) ---")
+        start = min(s for s, _ in a.phases.values())
+        def last_end(kind):
+            ends = [r.end for r in a.runs if r.kind == kind]
+            return fmt(max(ends)) if ends else "-"
+        weeks = (a.golive - start).days // 7
+        print(f"  {a.name:<10s} {ACTIVITY_PRIORITY.get(name, '?'):<4d} {a.type:<8s} {fmt(start):<10s} "
+              f"{fmt(a.phases['Development'][1]):<10s} {last_end('SIT'):<10s} {last_end('E2E'):<10s} "
+              f"{fmt(a.phases['Application test'][1]):<10s} "
+              f"{fmt(a.phases['Application test migrated'][1]):<10s} "
+              f"{fmt(a.ready):<10s} {last_end('DR'):<10s} {fmt(a.phases['FUT'][1]):<10s} "
+              f"{fmt(a.golive):<12s} {weeks:>4d}")
+    # Horizon check
+    late = [a.name for a in plans.values() if a.golive > PLAN_END]
+    if late:
+        print(f"\n  !! WARNING: activities finishing after the planning horizon: {', '.join(late)}")
+    print()
+
+def print_env_use(sched):
+    """Environment use over time: booked environment-days per month."""
+    print("=" * 100)
+    print("ENVIRONMENT USE OVER TIME  (booked environment-days per month; "
+          "n/a = outside availability window)")
+    print("=" * 100)
+
+    # Month buckets from plan start to horizon
+    months = []
+    y, m = PLAN_START.year, PLAN_START.month
+    while (y, m) <= (PLAN_END.year, PLAN_END.month):
+        months.append((y, m))
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+
+    # Booked days per environment per month
+    use = {e: {(yy, mm): 0 for (yy, mm) in months} for e in ENVIRONMENTS}
+    for env, bookings in sched.env_bookings.items():
+        for _, day in bookings:
+            key = (day.year, day.month)
+            if key in use[env]:
+                use[env][key] += 1
+
+    def avail_in_month(env, ym):
+        y, m = ym
+        for frm, to in ENVIRONMENTS[env]["windows"]:
+            if not (d(to).year < y or (d(to).year == y and d(to).month < m)) and \
+               not (d(frm).year > y or (d(frm).year == y and d(frm).month > m)):
+                return True
+        return False
+
+    hdr = "  {:<10s} {:<7s}".format("Environm.", "Cap") \
+        + "".join(f"{dt.date(y, m, 1).strftime('%b%y'):>6s}" for (y, m) in months) \
+        + f"{'Total':>7s}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    grand = 0
+    for e in sorted(ENVIRONMENTS):
+        total = len(sched.env_bookings[e])
+        grand += total
+        row = "  {:<10s} {:<7s}".format(e, ENVIRONMENTS[e]["capacity"])
+        for ym in months:
+            if avail_in_month(e, ym):
+                row += f"{use[e][ym]:>6d}"
+            else:
+                row += f"{'n/a':>6s}"
+        row += f"{total:>7d}"
+        print(row)
+    print("  " + "-" * (len(hdr) - 2))
+    print(f"  {'Total':<18s}".format("") + " " * (6 * len(months)) + f"{grand:>7d}")
+    print()
+
+def print_plans(plans, sched):
+    print_overview(plans)
+    print_env_use(sched)
+    print("=" * 100)
+    print("DETAIL")
+    print("=" * 100)
+    for name in sorted(ACTIVITY_PRIORITY, key=prio_sort_key):
+        if name not in plans:
+            continue
+        a = plans[name]
+        print(f"\n--- {a.name} ({a.type}, prio {ACTIVITY_PRIORITY.get(name, '?')}) ---")
         for ph in PHASES:
             if ph in a.phases:
                 s, e = a.phases[ph]
@@ -454,10 +694,25 @@ def print_plans(plans, sched):
         for run in a.runs:
             print(f"  {run.kind} {run.size:8s} @ {run.env:6s} {fmt(run.start)} -> {fmt(run.end)}")
         print(f"  {'Ready for migration':24s} {fmt(a.ready)}")
-        print(f"  {'Go-live prep complete':24s} {fmt(a.golive)}")
+        print(f"  {'Go-live':24s} {fmt(a.golive)}")
     print("\nEnvironment bookings:")
     for e in sorted(sched.env_bookings):
         print(f"  {e}: {len(sched.env_bookings[e])} days booked")
+
+    print("\nAssumptions:")
+    print(f"  Activities: {len(ACTIVITIES)} "
+          f"({sum(1 for t in ACTIVITIES.values() if t == 'simple')} simple, "
+          f"{sum(1 for t in ACTIVITIES.values() if t == 'complex')} complex)")
+    for typ, p in PHASE_PARAMS.items():
+        print(f"  [{typ}] dev {p['development']}wk | SIT {p['sit_runs']}x{p['sit_size']} "
+              f"({TEST_SIZES[p['sit_size']]['sit_days']}d) | E2E {p['e2e_runs']}x{p['e2e_size']} "
+              f"({TEST_SIZES[p['e2e_size']]['e2e_days']}d) | app test {p['application_test']}wk "
+              f"| app test migrated {p['application_test_migrated']}wk "
+              f"| inflight {p['inflight_order_test']}wk | dress rehearsal {p['dress_rehearsal_days']}d "
+              f"({p['dress_rehearsal_size']}) | FUT {p['fut']}wk")
+    for e, v in ENVIRONMENTS.items():
+        wins = "; ".join(f"{frm} to {to}" for frm, to in v["windows"])
+        print(f"  {e}: capacity={v['capacity']}, available {wins}")
 
 # ----------------------------------------------------------------------------
 #  MAIN
@@ -471,8 +726,8 @@ def main():
     sched = Scheduler()
     plans = sched.plan()
     print_plans(plans, sched)
-    build_deck(plans, sched, args.output)
-    print(f"\nPowerPoint deck written to: {args.output}")
+    #build_deck(plans, sched, args.output)
+    #print(f"\nPowerPoint deck written to: {args.output}")
 
 if __name__ == "__main__":
     main()
