@@ -80,9 +80,9 @@ TEST_SIZES = {
 #   windows:  list of (from_date, to_date) inclusive availability periods.
 ENVIRONMENTS = {
     "ENV-A": dict(capacity="all",    windows=[("2026-11-02", "2027-12-31")]),
-    "ENV-B": dict(capacity="all",    windows=[("2026-12-01", "2027-12-31")]),
+    "ENV-B": dict(capacity="all",    windows=[("2027-03-01", "2027-12-31")]),
     "ENV-C": dict(capacity="small",  windows=[("2026-11-02", "2027-12-31")]),
-    "ENV-D": dict(capacity="small",  windows=[("2026-11-30", "2027-12-31")]),
+    "ENV-D": dict(capacity="small",  windows=[("2027-03-01", "2027-12-31")]),
 }
 
 # Priority order in which activities compete for environments.
