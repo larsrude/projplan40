@@ -16,6 +16,7 @@ Run:  python3 migration_plan.py            -> writes migration_plan.pptx
 
 import argparse
 import datetime as dt
+import heapq
 from dataclasses import dataclass, field
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -85,8 +86,18 @@ ENVIRONMENTS = {
     "ENV-D": dict(capacity="small",  windows=[("2027-03-01", "2027-12-31")]),
 }
 
-# Priority order in which activities compete for environments.
-ACTIVITY_PRIORITY = ["Complex1", "Complex2", "Simple1", "Simple2", "Simple3", "Simple4"]
+# Priority for environment conflicts: 1 = highest, 6 = lowest.
+# When two activities compete for the same environment slot, the lower number wins.
+# Ties are broken deterministically: earliest-ready run first, then activity name.
+ACTIVITY_PRIORITY = {
+    "Simple1": 1, "Simple2": 1,
+    "Simple3": 3, "Simple4": 3,
+    "Complex1": 5, "Complex2": 5,
+}
+
+def prio_sort_key(name):
+    """Sort activities by priority (1 first), ties by name for stable output."""
+    return (ACTIVITY_PRIORITY.get(name, 99), name)
 
 # ----------------------------------------------------------------------------
 #  SCHEDULER
@@ -194,44 +205,70 @@ class Scheduler:
             f"number of runs in PHASE_PARAMS.")
 
     def plan(self):
+        """Schedule all activities.
+
+        Runs from all activities compete globally for environments. Runs are
+        booked in priority order (1 = highest); within the same priority, the
+        run that is ready earliest books first, ties broken by activity name.
+        A run's earliest start is the day after its activity's previous phase/run
+        ends (development -> SIT runs -> E2E runs are sequential per activity).
+        """
         plans = {}
-        for name in ACTIVITY_PRIORITY:
-            if name not in ACTIVITIES:
-                continue
+        heap = []   # entries: (prio, ready_date, name, kind, size, run_seq)
+
+        # Phase 1: development phases are unconstrained (no environment needed)
+        for name in ACTIVITIES:
             p = PHASE_PARAMS[ACTIVITIES[name]]
             a = ActivityPlan(name, ACTIVITIES[name])
-            cursor = next_workday(PLAN_START)   # roll to first working day
+            start = next_workday(PLAN_START)
+            end = add_workdays(start, p["development"] * WORKDAYS_PER_WEEK)
+            a.phases["Development"] = (start, end)
+            plans[name] = a
+            # First run (SIT) becomes ready the day after development ends
+            if p["sit_runs"]:
+                heap.append((ACTIVITY_PRIORITY.get(name, 99),
+                             next_workday(end + dt.timedelta(days=1)),
+                             name, "SIT", p["sit_size"], 1))
+        heapq.heapify(heap)
 
-            # Development (weeks)
-            end = add_workdays(cursor, p["development"] * WORKDAYS_PER_WEEK)
-            a.phases["Development"] = (cursor, end)
-            cursor = end + dt.timedelta(days=1)
+        # Phase 2: book environment runs in global priority order
+        remaining = {name: dict(sit=PHASE_PARAMS[ACTIVITIES[name]]["sit_runs"],
+                                e2e=PHASE_PARAMS[ACTIVITIES[name]]["e2e_runs"],
+                                sit_size=PHASE_PARAMS[ACTIVITIES[name]]["sit_size"],
+                                e2e_size=PHASE_PARAMS[ACTIVITIES[name]]["e2e_size"])
+                     for name in ACTIVITIES}
+        while heap:
+            prio, ready, name, kind, size, seq = heapq.heappop(heap)
+            run = self.book_run(name, kind, size, ready)
+            plans[name].runs.append(run)
+            # Chain the next run of this activity (SIT runs, then E2E runs)
+            nxt_ready = next_workday(run.end + dt.timedelta(days=1))
+            rem = remaining[name]
+            if kind == "SIT":
+                rem["sit"] -= 1
+                if rem["sit"] > 0:
+                    heapq.heappush(heap, (prio, nxt_ready, name, "SIT", rem["sit_size"], seq + 1))
+                elif rem["e2e"] > 0:
+                    heapq.heappush(heap, (prio, nxt_ready, name, "E2E", rem["e2e_size"], seq + 1))
+            else:
+                rem["e2e"] -= 1
+                if rem["e2e"] > 0:
+                    heapq.heappush(heap, (prio, nxt_ready, name, "E2E", rem["e2e_size"], seq + 1))
 
-            # SIT runs (sequential, environment constrained)
-            for _ in range(p["sit_runs"]):
-                run = self.book_run(name, "SIT", p["sit_size"], cursor)
-                a.runs.append(run)
-                cursor = run.end + dt.timedelta(days=1)
-
-            # End-to-end test runs (sequential, environment constrained)
-            for _ in range(p["e2e_runs"]):
-                run = self.book_run(name, "E2E", p["e2e_size"], cursor)
-                a.runs.append(run)
-                cursor = run.end + dt.timedelta(days=1)
-
-            # Application test and inflight order test in parallel
+        # Phase 3: application test + inflight order test in parallel, then go-live prep
+        for name in ACTIVITIES:
+            p = PHASE_PARAMS[ACTIVITIES[name]]
+            a = plans[name]
+            last_run_end = max((r.end for r in a.runs), default=a.phases["Development"][1])
+            cursor = next_workday(last_run_end + dt.timedelta(days=1))
             app_end = add_workdays(cursor, p["application_test"] * WORKDAYS_PER_WEEK)
             a.phases["Application test"] = (cursor, app_end)
             inf_end = add_workdays(cursor, p["inflight_order_test"] * WORKDAYS_PER_WEEK)
             a.phases["Inflight order test"] = (cursor, inf_end)
-
-            # Go-live preparation after readiness
             ready = max(app_end, inf_end)
             cursor = next_workday(ready + dt.timedelta(days=1))
             gl_end = add_workdays(cursor, p["go_live_prep"] * WORKDAYS_PER_WEEK)
             a.phases["Go-live preparation"] = (cursor, gl_end)
-
-            plans[name] = a
         return plans
 
 # ----------------------------------------------------------------------------
@@ -278,7 +315,7 @@ def slide_exec_summary(prs, plans):
     slide = prs.slides.add_slide(prs.slide_layouts[5])
     add_title(slide, "Migration Plan - Executive Summary",
               "Level 1: one line per activity, key milestones")
-    ordered = [plans[n] for n in ACTIVITY_PRIORITY if n in plans]
+    ordered = [plans[n] for n in sorted(ACTIVITY_PRIORITY, key=prio_sort_key) if n in plans]
     rows = len(ordered) + 1
     table = add_table(slide, rows, 7, 0.4, 1.1, 9.2, 0.4 * rows)
     headers = ["Activity", "Type", "Dev done", "Tests done", "Ready for migration",
@@ -429,8 +466,9 @@ def slide_assumptions(prs):
         "Per activity: Development -> SIT runs -> E2E runs -> Application test -> "
         "Go-live preparation are sequential.",
         "Inflight order test runs in parallel with Application test (starts same day).",
-        "SIT and E2E runs book a capable, available environment for consecutive working days;",
-        "activities are scheduled in priority order: " + ", ".join(ACTIVITY_PRIORITY) + ".",
+        "SIT and E2E runs book a capable, available environment for consecutive working days.",
+        "Environment conflicts resolve by priority (1 = highest, 6 = lowest): "
+        + ", ".join(f"{n}={p}" for n, p in sorted(ACTIVITY_PRIORITY.items(), key=prio_sort_key)) + ".",
         "Go-live preparation starts after readiness (max of application and inflight order tests).",
     ]
     tf.text = "\n".join(lines)
@@ -442,7 +480,7 @@ def build_deck(plans, sched, path):
     prs.slide_width = Inches(10)
     prs.slide_height = Inches(7.5)
     slide_exec_summary(prs, plans)
-    for name in ACTIVITY_PRIORITY:
+    for name in sorted(ACTIVITY_PRIORITY, key=prio_sort_key):
         if name in plans:
             slide_activity(prs, plans[name])
     slide_env_utilization(prs, sched)
@@ -459,19 +497,22 @@ def print_overview(plans):
     print(f"MIGRATION PLAN OVERVIEW   horizon: {fmt(PLAN_START)} -> {fmt(PLAN_END)}   "
           f"({WORKDAYS_PER_WEEK} working days/week)")
     print("=" * 100)
-    hdr = f"  {'Activity':<10s} {'Type':<8s} {'Start':<10s} {'Dev done':<10s} " \
-          f"{'Tests done':<10s} {'Ready':<10s} {'Go-live done':<12s} {'Weeks':>5s}"
+    hdr = f"  {'Activity':<10s} {'Prio':<4s} {'Type':<8s} {'Start':<10s} {'Dev done':<10s} " \
+          f"{'SIT done':<10s} {'E2E done':<10s} {'Ready':<10s} {'Go-live done':<12s} {'Weeks':>5s}"
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
-    for name in ACTIVITY_PRIORITY:
+    for name in sorted(ACTIVITY_PRIORITY, key=prio_sort_key):
         if name not in plans:
             continue
         a = plans[name]
         start = min(s for s, _ in a.phases.values())
-        tests = max((r.end for r in a.runs), default=a.phases["Application test"][0])
+        def last_end(kind):
+            ends = [r.end for r in a.runs if r.kind == kind]
+            return fmt(max(ends)) if ends else "-"
         weeks = (a.golive - start).days // 7
-        print(f"  {a.name:<10s} {a.type:<8s} {fmt(start):<10s} {fmt(a.phases['Development'][1]):<10s} "
-              f"{fmt(tests):<10s} {fmt(a.ready):<10s} {fmt(a.golive):<12s} {weeks:>4d}")
+        print(f"  {a.name:<10s} {ACTIVITY_PRIORITY.get(name, '?'):<4d} {a.type:<8s} {fmt(start):<10s} "
+              f"{fmt(a.phases['Development'][1]):<10s} {last_end('SIT'):<10s} {last_end('E2E'):<10s} "
+              f"{fmt(a.ready):<10s} {fmt(a.golive):<12s} {weeks:>4d}")
     # Horizon check
     late = [a.name for a in plans.values() if a.golive > PLAN_END]
     if late:
@@ -483,11 +524,11 @@ def print_plans(plans, sched):
     print("=" * 100)
     print("DETAIL")
     print("=" * 100)
-    for name in ACTIVITY_PRIORITY:
+    for name in sorted(ACTIVITY_PRIORITY, key=prio_sort_key):
         if name not in plans:
             continue
         a = plans[name]
-        print(f"\n--- {a.name} ({a.type}) ---")
+        print(f"\n--- {a.name} ({a.type}, prio {ACTIVITY_PRIORITY.get(name, '?')}) ---")
         for ph in PHASES:
             if ph in a.phases:
                 s, e = a.phases[ph]
