@@ -78,10 +78,10 @@ TEST_SIZES = {
 #             "all"    = can take any size run.
 #   windows:  list of (from_date, to_date) inclusive availability periods.
 ENVIRONMENTS = {
-    "ENV-A": dict(capacity="all",    windows=[("2025-01-06", "2025-12-31")]),
-    "ENV-B": dict(capacity="all",    windows=[("2025-03-03", "2025-12-31")]),
-    "ENV-C": dict(capacity="small",  windows=[("2025-01-06", "2025-06-30")]),
-    "ENV-D": dict(capacity="small",  windows=[("2025-02-03", "2025-09-30")]),
+    "ENV-A": dict(capacity="all",    windows=[("2026-01-05", "2026-12-31")]),
+    "ENV-B": dict(capacity="all",    windows=[("2026-03-02", "2026-12-31")]),
+    "ENV-C": dict(capacity="small",  windows=[("2026-01-05", "2026-06-30")]),
+    "ENV-D": dict(capacity="small",  windows=[("2026-02-02", "2026-09-30")]),
 }
 
 # Priority order in which activities compete for environments.
@@ -157,8 +157,12 @@ class Scheduler:
         """Find earliest slot of consecutive working days in a capable, free env."""
         n_days = TEST_SIZES[size][kind.lower().replace("e2e", "e2e") + "_days"] \
             if kind == "SIT" else TEST_SIZES[size]["e2e_days"]
+        # A run must fall inside an environment availability window, so there is
+        # no point searching past the last available day of any window.
+        last_available = max(d(to) for env in ENVIRONMENTS.values()
+                             for _, to in env["windows"])
         day = next_workday(earliest)
-        while True:
+        while day <= last_available:
             days = []
             cur = day
             for _ in range(n_days):
@@ -177,6 +181,16 @@ class Scheduler:
                 self.runs.append(run)
                 return run
             day = next_workday(day + dt.timedelta(days=1))
+        # Search deadline reached without a slot: explain why instead of looping forever.
+        capable = [e for e in ENVIRONMENTS
+                   if ENVIRONMENTS[e]["capacity"] == "all" or size == "small"]
+        raise RuntimeError(
+            f"Cannot schedule {kind} run ({size}, {n_days} days) for {activity}: "
+            f"no capable, available, free environment was found before "
+            f"{fmt(last_available)} (the last day of any environment window). "
+            f"Capable environments by size: {capable or 'none'}. "
+            f"Check ENVIRONMENTS windows/capacity, TEST_SIZES, PLAN_START and the "
+            f"number of runs in PHASE_PARAMS.")
 
     def plan(self):
         plans = {}
@@ -471,8 +485,8 @@ def main():
     sched = Scheduler()
     plans = sched.plan()
     print_plans(plans, sched)
-#    build_deck(plans, sched, args.output)
-#    print(f"\nPowerPoint deck written to: {args.output}")
+    build_deck(plans, sched, args.output)
+    print(f"\nPowerPoint deck written to: {args.output}")
 
 if __name__ == "__main__":
     main()
